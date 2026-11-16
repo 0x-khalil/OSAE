@@ -1,0 +1,13 @@
+# PyTorch with CUDA: install first from the official index, e.g.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+torch>=2.4
+torchvision>=0.19
+numpy
+scipy
+pandas
+scikit-learn
+matplotlib
+pyyaml
+tabulate
+umap-learn   # optional: UMAP plots (skipped automatically if missing)
+huggingface_hub   # publish_hf.py

@@ -1,0 +1,96 @@
+# Full experimental protocol. Run with:  python scripts/run_all.py --config configs/default.yaml
+# Every setting that must be identical across experiments lives here, once.
+
+data_dir: data/stl10
+runs_dir: runs
+results_dir: results
+amp: bf16                      # bf16 autocast (Ampere+); use "none" for fp32
+
+# Jobs run concurrently on the one GPU. 1 = sequential (fine for an 8 GB laptop GPU).
+# On a 24-32 GB GPU (RTX 4090 / 5090): downstream_jobs 4, pretrain_jobs 2. CLI: --jobs / --pretrain_jobs.
+parallel:
+  downstream_jobs: 1
+  pretrain_jobs: 1
+
+splits:
+  fractions: [0.1, 0.25, 0.5, 1.0]   # of the 4,500-image labelled pool (after removing validation)
+  val_per_class: 50                  # 500-image stratified validation split (model selection / early stopping)
+  split_seed: 0                      # fixed -> identical subsets for every method and seed
+  unlabeled_holdout: 2000            # unlabeled images held out to monitor reconstruction
+
+seeds: [0, 1, 2]                     # downstream seeds (init of head / scratch model, data order, augmentation)
+pretrain_seeds: [0]                  # [0] = one AE per variant shared by all downstream seeds;
+                                     # [0, 1, 2] = downstream seed s uses AE pre-trained with seed s (3x cost)
+
+# ---------------------------------------------------------------------------- AE pre-training
+pretrain:
+  epochs: 20                   # over 98,000 unlabeled images
+  batch_size: 128
+  lr: 0.001                    # AdamW, linear warm-up then cosine decay
+  weight_decay: 0.0001
+  warmup_epochs: 1
+  noise_std: 0.5               # Gaussian denoising: std in normalised units
+  mask_ratio: 0.5              # masking denoising: fraction of 8x8 patches zeroed
+  mask_patch: 8
+  max_steps: null
+
+# Stage 1: sparsity sweep on the overcomplete AE (clean inputs). lambda* = the lambda > 0 with the best
+# mean *validation* accuracy of a frozen-encoder probe on the selection grid below.
+lambda_sweep:
+  latent_channels: 2048
+  values: [0.001, 0.01, 0.1]   # lambda = 0 (non-sparse OAE) is always trained as variant `oae`
+  selection:
+    protocol: frozen
+    fractions: [0.1, 1.0]
+    seeds: [0]
+  full_downstream_grid: false  # true -> also run every protocol/fraction/seed for every sweep lambda
+
+# Stage 2: factorial design {undercomplete, overcomplete} x {lambda=0, lambda*} x {clean, Gaussian}
+# + masking-denoising OAE.  `lambda_star` is resolved after stage 1.
+variants:
+  ae:                    {latent_channels: 128,  l1_lambda: 0.0,         noise: none}       # Experiment B
+  ae_sparse:             {latent_channels: 128,  l1_lambda: lambda_star, noise: none}
+  ae_denoise:            {latent_channels: 128,  l1_lambda: 0.0,         noise: gaussian}
+  ae_sparse_denoise:     {latent_channels: 128,  l1_lambda: lambda_star, noise: gaussian}
+  oae:                   {latent_channels: 2048, l1_lambda: 0.0,         noise: none}
+  oae_sparse:            {latent_channels: 2048, l1_lambda: lambda_star, noise: none}       # Experiment C
+  oae_denoise:           {latent_channels: 2048, l1_lambda: 0.0,         noise: gaussian}
+  oae_sparse_denoise:    {latent_channels: 2048, l1_lambda: lambda_star, noise: gaussian}   # Experiment C
+  oae_sparse_mask:       {latent_channels: 2048, l1_lambda: lambda_star, noise: mask}       # Experiment C
+
+# Rows of the headline table. With several candidates, the one with the best mean validation accuracy wins.
+main_table:
+  ResNet-18 baseline: [scratch]
+  Random frozen ResNet-18 (control): [random]
+  Standard AE: [ae]
+  Sparse OAE: [oae_sparse, oae_sparse_denoise, oae_sparse_mask]
+
+# Paired statistical comparisons (A, B) -> reports B - A. Row names of main_table or variant names.
+comparisons:
+  - [ResNet-18 baseline, Standard AE]
+  - [ResNet-18 baseline, Sparse OAE]
+  - [Standard AE, Sparse OAE]
+  - [ae, oae]                  # overcompleteness alone
+  - [oae, oae_sparse]          # sparsity given overcompleteness
+  - [ae, ae_sparse]            # sparsity given undercompleteness
+  - [oae_sparse, oae_sparse_denoise]  # denoising given sparse OAE
+  - [ae, ae_denoise]           # denoising given undercomplete AE
+
+# ---------------------------------------------------------------------------- downstream
+downstream:
+  protocols: [finetune, frozen]
+  common:                      # identical for every method, fraction and seed
+    steps: 2000                # fixed optimisation budget (batch 128 -> ~57 epochs at 100%, ~570 at 10%)
+    batch_size: 128
+    momentum: 0.9              # SGD + Nesterov, linear warm-up then cosine decay
+    warmup_steps: 100
+    eval_every: 100            # validation check; the best-validation checkpoint is kept (early stopping)
+    patience: 0
+    label_smoothing: 0.0
+  finetune: {lr: 0.05, weight_decay: 0.0005}
+  frozen:   {lr: 0.1,  weight_decay: 0.0}
+
+analysis:
+  embed_samples: 2000          # points in t-SNE / UMAP plots
+  include_supervised_reference: true   # add the 100%-label scratch model (seed 0) to the analysis
+  pairs: ["ae,oae_sparse", "ae,oae", "oae,oae_sparse", "scratch_100,oae_sparse"]

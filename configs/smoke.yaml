@@ -1,0 +1,54 @@
+# Tiny end-to-end check of the whole pipeline (minutes, not hours). Numbers are meaningless.
+#   python scripts/run_all.py --config configs/smoke.yaml
+data_dir: data/stl10
+runs_dir: runs_smoke
+results_dir: results_smoke
+amp: bf16
+
+# Jobs run concurrently on the one GPU. 1 = sequential (fine for an 8 GB laptop GPU).
+# On a 24-32 GB GPU (RTX 4090 / 5090): downstream_jobs 4, pretrain_jobs 2. CLI: --jobs / --pretrain_jobs.
+parallel:
+  downstream_jobs: 1
+  pretrain_jobs: 1
+
+splits: {fractions: [0.1, 0.25, 0.5, 1.0], val_per_class: 50, split_seed: 0, unlabeled_holdout: 2000}
+seeds: [0, 1]
+pretrain_seeds: [0]
+
+pretrain: {epochs: 1, batch_size: 64, lr: 0.001, weight_decay: 0.0001, warmup_epochs: 1,
+           noise_std: 0.5, mask_ratio: 0.5, mask_patch: 8, max_steps: 30, holdout_max: 256}
+
+lambda_sweep:
+  latent_channels: 2048
+  values: [0.01, 0.1]
+  selection: {protocol: frozen, fractions: [0.1], seeds: [0]}
+  full_downstream_grid: false
+
+variants:
+  ae:                 {latent_channels: 128,  l1_lambda: 0.0,         noise: none}
+  oae:                {latent_channels: 2048, l1_lambda: 0.0,         noise: none}
+  oae_sparse:         {latent_channels: 2048, l1_lambda: lambda_star, noise: none}
+  oae_sparse_mask:    {latent_channels: 2048, l1_lambda: lambda_star, noise: mask}
+
+main_table:
+  ResNet-18 baseline: [scratch]
+  Random frozen ResNet-18 (control): [random]
+  Standard AE: [ae]
+  Sparse OAE: [oae_sparse, oae_sparse_mask]
+
+comparisons:
+  - [ResNet-18 baseline, Sparse OAE]
+  - [Standard AE, Sparse OAE]
+  - [ae, oae]
+
+downstream:
+  protocols: [finetune, frozen]
+  common: {steps: 20, batch_size: 64, momentum: 0.9, warmup_steps: 5, eval_every: 10, patience: 0, label_smoothing: 0.0}
+  finetune: {lr: 0.05, weight_decay: 0.0005}
+  frozen:   {lr: 0.1,  weight_decay: 0.0}
+
+analysis:
+  embed_samples: 300
+  max_pool: 500
+  include_supervised_reference: true
+  pairs: ["ae,oae_sparse"]
