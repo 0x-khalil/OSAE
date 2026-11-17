@@ -124,7 +124,11 @@ def main():
     from osae.utils import load_config
     cfg = load_config(ROOT / args.config)
     n_gpu = check_gpus()
-    check(state_repo)
+    try:
+        check(state_repo)
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"Cannot write to Hugging Face repo {state_repo}: {e}\n"
+                 "Check that the HF_TOKEN secret is a token with WRITE access for this account.")
     pull(state_repo, cfg)
 
     deadline = T0 + 3600 * (args.session_hours - args.reserve_hours)

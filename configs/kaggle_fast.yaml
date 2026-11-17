@@ -1,0 +1,14 @@
+# Kaggle (2x T4) with the halved training budget: fits in ONE 12-hour session (~6-7.5 h estimated).
+# Same design as the full study (all variants, both protocols, 4 fractions, 3 seeds); only
+# pre-training epochs (20 -> 10) and downstream steps (2000 -> 1000) are halved.
+base: kaggle.yaml
+
+runs_dir: runs_fast
+results_dir: results_fast
+
+pretrain:
+  epochs: 10
+
+downstream:
+  common:
+    steps: 1000
