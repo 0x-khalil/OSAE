@@ -1,0 +1,7 @@
+# Kaggle free tier (2x Tesla T4, 12 h sessions). Same scientific protocol as default.yaml; only the
+# infrastructure differs. Run with scripts/kaggle_session.py (see README, "Running on Kaggle").
+base: default.yaml
+
+data_dir: /tmp/stl10        # outside /kaggle/working (20 GB output limit); re-downloaded each session
+delete_raw_data: true       # drop the 2.6 GB archive after conversion
+amp: auto                   # T4 has no bf16 -> fp16 with loss scaling (bf16 on Ampere+ GPUs)

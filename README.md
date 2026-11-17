@@ -45,6 +45,37 @@ is the full study.
 The full study takes roughly **16–17 h** of GPU time. To cut it, lower `pretrain.epochs` or
 `downstream.common.steps`, or run stages selectively with `--stages` / `--only`. On Linux/macOS, use `.venv/bin/python` instead of `.venv/Scripts/python`.
 
+### Halved budget: `configs/fast.yaml`
+
+This is the same design as the full study: every variant, both protocols, all 4 fractions and 3 seeds.
+Only the training budget is halved:
+- 10 pre-training epochs instead of 20
+- 1,000 downstream steps instead of 2,000
+
+It takes about 7–8 h on an RTX 3070 Laptop and writes to `runs_fast/` and `results_fast/`, so it never
+mixes with a full-budget run.
+
+```bash
+.venv/Scripts/python scripts/run_all.py --config configs/fast.yaml
+```
+
+### Running on Kaggle's free GPUs (2× T4, 12-hour sessions)
+
+`scripts/kaggle_session.py` runs the full study across as many sessions as it takes:
+- **Precision:** T4s have no bf16, so `amp: auto` switches to fp16 with loss scaling. The frozen random-trunk control runs in fp32 to avoid overflow.
+- **GPUs:** jobs are spread over both GPUs (2 downstream runs or 1 pre-training per GPU).
+- **Saving progress:** before the 12-hour limit, the script stops starting new work. Pre-training pauses at an epoch boundary. Progress is pushed to a private Hugging Face dataset repo (`<repo>-state`) every 40 minutes and at the end.
+- **Resuming:** the next session restores from that repo and continues. Once everything is finished, the results are published to the public repo.
+
+Setup:
+1. Import `notebooks/osae_kaggle.ipynb` into Kaggle.
+2. Set **Accelerator: GPU T4 x2** and **Internet: on**.
+3. Add a Kaggle *Secret* named `HF_TOKEN` and attach it to the notebook.
+4. Click **Save & Run All (Commit)**. Repeat each time the log ends with `SESSION PAUSED`.
+
+The full study is expected to take about 2 sessions (13–17 h of the 30 h weekly quota). This is
+estimated, not measured on a T4.
+
 ### One command on a rented pod: full study + publish to Hugging Face
 
 ```bash

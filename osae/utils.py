@@ -37,8 +37,49 @@ def get_device() -> torch.device:
 
 
 def amp_dtype(name: str | None):
+    """Mixed-precision dtype. 'auto' = bf16 on Ampere or newer (RTX 30xx/40xx/50xx, A100...), fp16 on
+    older GPUs without bf16 support (e.g. Kaggle's Tesla T4 / P100), None on CPU."""
     name = (name or "none").lower()
+    if name == "auto":
+        if not torch.cuda.is_available():
+            return None
+        return torch.bfloat16 if torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
     return {"bf16": torch.bfloat16, "fp16": torch.float16, "none": None, "fp32": None}[name]
+
+
+def amp_name(dtype) -> str:
+    return {torch.bfloat16: "bf16", torch.float16: "fp16", None: "fp32"}[dtype]
+
+
+def grad_scaler(dtype):
+    """Loss scaling is needed for fp16 (narrow exponent range), not for bf16 / fp32."""
+    return torch.amp.GradScaler("cuda", enabled=dtype == torch.float16 and torch.cuda.is_available())
+
+
+def atomic_torch_save(obj, path: str | Path) -> None:
+    """Write to a temp file and rename, so a concurrent reader / uploader never sees a partial file."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def load_config(path: str | Path) -> dict:
+    """Load a YAML config. A ``base: other.yaml`` key (relative to this file) is loaded first and
+    recursively overridden by this file's values, so variant configs only list what they change."""
+    path = Path(path)
+    cfg = load_yaml(path)
+    base = cfg.pop("base", None)
+    if base:
+        return _deep_merge(load_config(path.parent / base), cfg)
+    return cfg
+
+
+def _deep_merge(a: dict, b: dict) -> dict:
+    out = dict(a)
+    for k, v in b.items():
+        out[k] = _deep_merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
 
 
 def autocast(device: torch.device, dtype):

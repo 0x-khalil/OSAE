@@ -4,7 +4,7 @@
 data_dir: data/stl10
 runs_dir: runs
 results_dir: results
-amp: bf16                      # bf16 autocast (Ampere+); use "none" for fp32
+amp: auto                      # bf16 on Ampere+ (RTX 30xx-50xx, A100), fp16 + loss scaling on older GPUs (T4); "none" = fp32
 
 # Jobs run concurrently on the one GPU. 1 = sequential (fine for an 8 GB laptop GPU).
 # On a 24-32 GB GPU (RTX 4090 / 5090): downstream_jobs 4, pretrain_jobs 2. CLI: --jobs / --pretrain_jobs.

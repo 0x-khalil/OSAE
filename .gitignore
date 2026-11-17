@@ -13,3 +13,7 @@ results_smoke_par/
 configs/_*.yaml
 .env
 *.token
+runs_fast/
+results_fast/
+runs_t/
+results_t/

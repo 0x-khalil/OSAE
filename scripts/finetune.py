@@ -25,8 +25,8 @@ import torch.nn.functional as F
 from osae.data import GPULoader, infinite, labeled_indices, load_labeled, load_splits, load_stats
 from osae.metrics import classification_report
 from osae.models import Classifier, load_trunk_into
-from osae.utils import (Timer, amp_dtype, autocast, cosine_with_warmup, count_params, env_info, get_device,
-                        save_json, set_lr, set_seed)
+from osae.utils import (Timer, amp_dtype, amp_name, atomic_torch_save, autocast, cosine_with_warmup, count_params,
+                        env_info, get_device, grad_scaler, save_json, set_lr, set_seed)
 
 
 def parse():
@@ -47,7 +47,8 @@ def parse():
     ap.add_argument("--label_smoothing", type=float, default=0.0)
     ap.add_argument("--eval_every", type=int, default=100)
     ap.add_argument("--patience", type=int, default=0, help="early stop after N evals w/o val improvement (0=off)")
-    ap.add_argument("--amp", default="bf16", choices=["bf16", "none"])  # no fp16: would need loss scaling
+    ap.add_argument("--amp", default="auto", choices=["auto", "bf16", "fp16", "none"],
+                    help="auto = bf16 on Ampere+, fp16 (with loss scaling) on older GPUs such as T4")
     ap.add_argument("--deterministic", action="store_true")
     args = ap.parse_args()
     if args.init == "pretrained" and not args.pretrained:
@@ -83,6 +84,11 @@ def main():
     set_seed(args.seed, args.deterministic)
     dev = get_device()
     adt = amp_dtype(args.amp)
+    # A frozen *random* trunk has untrained BN statistics, so its activations grow layer by layer and can
+    # overflow fp16. That control is forward-only and cheap, so it runs in fp32 (bf16 has fp32's range).
+    if args.init == "random" and adt == torch.float16:
+        adt = None
+    scaler = grad_scaler(adt)
 
     mean, std = load_stats(args.data_dir)
     splits = load_splits(args.data_dir)
@@ -135,8 +141,9 @@ def main():
                 logits = model(x)
         loss = F.cross_entropy(logits.float(), yb, label_smoothing=args.label_smoothing)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
+        scaler.scale(loss).backward()
+        scaler.step(opt)  # skips the update if fp16 gradients overflowed
+        scaler.update()
         if step % args.eval_every == 0 or step == args.steps:
             timer.stop()
             rep, vloss = evaluate(model, val_loader, dev, adt)
@@ -146,8 +153,8 @@ def main():
             if rep["top1"] > best["val_top1"]:  # strict '>' -> earliest best step wins ties
                 best = {"val_top1": rep["top1"], "val_macro_f1": rep["macro_f1"], "val_loss": vloss, "step": step}
                 state = model.head.state_dict() if (frozen and args.init == "pretrained") else model.state_dict()
-                torch.save({"state_dict": state, "head_only": frozen and args.init == "pretrained",
-                            "pretrained": args.pretrained, "config": vars(args)}, out / "best.pt")
+                atomic_torch_save({"state_dict": state, "head_only": frozen and args.init == "pretrained",
+                                   "pretrained": args.pretrained, "config": vars(args)}, out / "best.pt")
                 bad_evals = 0
             else:
                 bad_evals += 1
@@ -170,6 +177,7 @@ def main():
         "best": best,
         "history": history,
         "train_time_s": timer.total,
+        "amp_resolved": amp_name(adt),
         "steps_run": history[-1]["step"] if history else 0,
         "peak_gpu_mem_mb": torch.cuda.max_memory_allocated() / 2**20 if dev.type == "cuda" else None,
         "params_total": count_params(model),

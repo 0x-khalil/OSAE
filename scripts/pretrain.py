@@ -14,6 +14,7 @@ import _bootstrap  # noqa: F401
 
 import argparse
 import math
+import sys
 import time
 from pathlib import Path
 
@@ -24,8 +25,10 @@ import torch.nn.functional as F
 from osae.data import GPULoader, corrupt, load_array, load_splits, load_stats
 from osae.metrics import SparsityAccumulator
 from osae.models import ConvAutoencoder
-from osae.utils import (Timer, amp_dtype, autocast, cosine_with_warmup, env_info, get_device, save_json,
-                        set_lr, set_seed)
+from osae.utils import (Timer, amp_dtype, amp_name, atomic_torch_save, autocast, cosine_with_warmup, env_info,
+                        get_device, grad_scaler, save_json, set_lr, set_seed)
+
+EXIT_DEADLINE = 3  # run_all.py treats this exit code as "paused, resume later", not as a failure
 
 
 def parse():
@@ -45,7 +48,10 @@ def parse():
     ap.add_argument("--weight_decay", type=float, default=1e-4)
     ap.add_argument("--warmup_epochs", type=float, default=1.0)
     ap.add_argument("--grad_clip", type=float, default=1.0)
-    ap.add_argument("--amp", default="bf16", choices=["bf16", "none"])  # no fp16: would need loss scaling
+    ap.add_argument("--amp", default="auto", choices=["auto", "bf16", "fp16", "none"],
+                    help="auto = bf16 on Ampere+, fp16 (with loss scaling) on older GPUs such as T4")
+    ap.add_argument("--deadline", type=float, default=None,
+                    help="unix time; past it, save a resumable checkpoint at the next epoch end and exit 3")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--deterministic", action="store_true")
     ap.add_argument("--log_every", type=int, default=100)
@@ -111,6 +117,7 @@ def main():
     set_seed(args.seed, args.deterministic)
     dev = get_device()
     adt = amp_dtype(args.amp)
+    scaler = grad_scaler(adt)
 
     mean, std = load_stats(args.data_dir)
     splits = load_splits(args.data_dir)
@@ -137,6 +144,8 @@ def main():
     if (out / "last.pt").exists():  # resume
         ck = torch.load(out / "last.pt", map_location=dev, weights_only=False)
         model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
+        if "scaler" in ck:
+            scaler.load_state_dict(ck["scaler"])
         step, history, start_epoch = ck["step"], ck["history"], ck["epoch"]
         train_loader.rng = np.random.default_rng(args.seed + 1000 * start_epoch)
         print(f"resumed at epoch {start_epoch} step {step}")
@@ -146,6 +155,10 @@ def main():
           f"steps={total} params={model.param_breakdown()}", flush=True)
 
     timer = Timer()
+    if history:  # resumed: keep counting training time from where it stopped
+        timer.total = history[-1]["train_time_s"]
+    print(f"mixed precision: {amp_name(adt)}", flush=True)
+    bad_steps = 0
     if dev.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
     model.train()
@@ -164,10 +177,20 @@ def main():
             l1 = z.float().abs().mean()
             loss = rec + args.l1_lambda * l1
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            if not math.isfinite(loss.item()):
+                # fp16 forward overflow: skip this batch; abort only if it keeps happening
+                bad_steps += 1
+                if bad_steps >= 20:
+                    raise FloatingPointError("20 consecutive non-finite losses")
+                step += 1
+                continue
+            bad_steps = 0
+            scaler.scale(loss).backward()
             if args.grad_clip:
+                scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
             model.renorm_decoder()
             step += 1
             if step % args.log_every == 0:
@@ -177,8 +200,6 @@ def main():
                 print(f"ep {epoch} step {step}/{total} rec {rec.item():.4f} l1 {l1.item():.4f} "
                       f"active {act:.3f} lr {opt.param_groups[0]['lr']:.2e} "
                       f"{args.log_every * args.batch_size / dt:.0f} img/s", flush=True)
-            if not math.isfinite(loss.item()):
-                raise FloatingPointError("non-finite loss")
         timer.stop()
         epoch += 1
         ev = evaluate_holdout(model, hold_loader, args.l1_lambda)
@@ -187,14 +208,16 @@ def main():
         print(f"== epoch {epoch}: holdout mse {ev['recon_mse_normalized']:.4f} psnr {ev['psnr_db']:.2f} "
               f"active {ev['fraction_active']:.3f} dead {ev['dead_channel_fraction']:.3f}", flush=True)
         save_json(history, out / "history.json")
-        torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "epoch": epoch,
-                    "history": history}, out / "last.pt")
+        atomic_torch_save({"model": model.state_dict(), "opt": opt.state_dict(), "scaler": scaler.state_dict(),
+                           "step": step, "epoch": epoch, "history": history}, out / "last.pt")
+        if args.deadline and time.time() > args.deadline and step < total:
+            print(f"deadline reached after epoch {epoch}: checkpoint saved, exiting to resume later", flush=True)
+            sys.exit(EXIT_DEADLINE)
 
     final = evaluate_holdout(model, hold_loader, args.l1_lambda)
     save_recon_grid(model, hold_loader, out / "recon.png")
     cfg = vars(args)
-    torch.save({"encoder": model.encoder.state_dict(), "config": cfg}, out / "encoder.pt")
-    torch.save({"model": model.state_dict(), "config": cfg}, out / "model.pt")
+    atomic_torch_save({"model": model.state_dict(), "config": cfg}, out / "model.pt")
     save_json({
         "config": cfg,
         "latent_shape": model.latent_shape(),
@@ -204,11 +227,14 @@ def main():
         "params": model.param_breakdown(),
         "steps": step,
         "train_time_s": timer.total,
+        "amp_resolved": amp_name(adt),
         "train_throughput_img_s": step * args.batch_size / max(timer.total, 1e-9),
         "peak_gpu_mem_mb": torch.cuda.max_memory_allocated() / 2**20 if dev.type == "cuda" else None,
         "holdout_final": final,
         "env": env_info(),
     }, out / "metrics.json")
+    # encoder.pt is the "finished" marker, so it is written last
+    atomic_torch_save({"encoder": model.encoder.state_dict(), "config": cfg}, out / "encoder.pt")
     (out / "last.pt").unlink(missing_ok=True)
     print("done:", out)
 

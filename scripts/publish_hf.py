@@ -21,7 +21,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from osae.utils import ROOT, load_json, load_yaml
+from osae.utils import ROOT, load_config, load_json
 
 
 def model_card(repo_id: str, cfg: dict, results_md: str, lambda_sel: dict | None, github: str | None) -> str:
@@ -89,7 +89,7 @@ def main():
 
     from huggingface_hub import HfApi
 
-    cfg = load_yaml(ROOT / args.config)
+    cfg = load_config(ROOT / args.config)
     runs, results = ROOT / cfg["runs_dir"], ROOT / cfg["results_dir"]
     if not (results / "RESULTS.md").exists():
         raise SystemExit(f"{results / 'RESULTS.md'} not found - run the study (scripts/run_all.py) first")

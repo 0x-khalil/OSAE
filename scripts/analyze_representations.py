@@ -109,7 +109,7 @@ def main():
     ap.add_argument("--embed_samples", type=int, default=2000)
     ap.add_argument("--max_pool", type=int, default=None, help="limit train-pool images (smoke tests)")
     ap.add_argument("--no_umap", action="store_true")
-    ap.add_argument("--amp", default="bf16")
+    ap.add_argument("--amp", default="auto")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -139,11 +139,12 @@ def main():
         kind, model = load_model(path, dev)
         print(f"== {name} ({kind}) from {path}", flush=True)
         sp = SparsityAccumulator(model.latent_channels) if kind == "ae" else None
-        ftr = extract(kind, model, L(X, pool), dev, adt, sp)
-        fva = extract(kind, model, L(X, val), dev, adt, sp)
+        madt = None if (path == "random" and adt == torch.float16) else adt  # random trunk: fp32 (overflow)
+        ftr = extract(kind, model, L(X, pool), dev, madt, sp)
+        fva = extract(kind, model, L(X, val), dev, madt, sp)
         res = {"kind": kind, "path": path}
         if kind == "ae":
-            fh = extract(kind, model, L(U, hold), dev, adt, None)
+            fh = extract(kind, model, L(U, hold), dev, madt, None)
             res.update({
                 "latent_channels": model.latent_channels,
                 "latent_dim": model.latent_numel(),

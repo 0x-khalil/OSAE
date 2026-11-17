@@ -1,0 +1,18 @@
+# Same protocol as default.yaml (all variants, both protocols, 4 fractions, 3 seeds) with a halved
+# training budget: ~7-7.5 h on an RTX 3070 Laptop instead of ~16-17 h. Results go to separate folders
+# so they never mix with a full-budget run.
+base: default.yaml
+
+runs_dir: runs_fast
+results_dir: results_fast
+
+parallel:
+  downstream_jobs: 2          # 2 concurrent downstream runs fit easily in 8 GB
+  pretrain_jobs: 1            # one AE pre-training (~4.5 GB) at a time on 8 GB
+
+pretrain:
+  epochs: 10                  # default: 20
+
+downstream:
+  common:
+    steps: 1000               # default: 2000 (still ~28 epochs at 100% labels, ~280 at 10%)

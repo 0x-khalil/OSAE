@@ -19,11 +19,30 @@ from osae.models import Classifier, load_trunk_into
 from osae.utils import amp_dtype, autocast, count_params, get_device, load_json, save_json
 
 
+def resolve_encoder(run_dir: Path, stored: str) -> Path:
+    """The stored encoder path is absolute; after moving / restoring runs (e.g. a new Kaggle session) fall
+    back to the same pre-training folder under this run's runs/ root
+    (runs/downstream/<variant>/<protocol>/f<frac>/s<seed> -> runs/pretrain/<name>/encoder.pt)."""
+    p = Path(stored)
+    if p.exists():
+        return p
+    alt = Path(run_dir).resolve().parents[4] / "pretrain" / p.parent.name / "encoder.pt"
+    if alt.exists():
+        return alt
+    raise FileNotFoundError(f"pre-trained encoder not found: {stored} (also tried {alt})")
+
+
+def run_amp(run_dir: Path, adt):
+    """The frozen random-trunk control is evaluated in fp32 when fp16 would be used (overflow risk)."""
+    cfg = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)["config"]
+    return None if (cfg.get("init") == "random" and adt == torch.float16) else adt
+
+
 def build(run_dir: Path, dev) -> Classifier:
     ck = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)
     model = Classifier()
     if ck["head_only"]:
-        load_trunk_into(model, ck["pretrained"])
+        load_trunk_into(model, str(resolve_encoder(run_dir, ck["pretrained"])))
         model.head.load_state_dict(ck["state_dict"])
     else:
         model.load_state_dict(ck["state_dict"])
@@ -45,7 +64,7 @@ def main():
     ap.add_argument("--runs_dir", default="runs/downstream")
     ap.add_argument("--data_dir", default="data/stl10")
     ap.add_argument("--results_dir", default="results")
-    ap.add_argument("--amp", default="bf16")
+    ap.add_argument("--amp", default="auto")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
@@ -67,7 +86,7 @@ def main():
             bench = {"params_total": count_params(model), "amp": args.amp,
                      "benchmark": inference_benchmark(model, dev, adt)}
             save_json(bench, bench_path)
-        yt, yp = predict(model, loader, dev, adt)
+        yt, yp = predict(model, loader, dev, run_amp(r, adt))
         rep = classification_report(yt, yp)
         rep["inference"] = bench
         save_json(rep, r / "test_metrics.json")

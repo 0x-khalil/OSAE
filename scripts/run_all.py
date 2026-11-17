@@ -20,6 +20,7 @@ import _bootstrap  # noqa: F401
 
 import argparse
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -27,17 +28,26 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from osae.utils import ROOT, fmt_key, load_json, load_yaml, save_json
+from osae.utils import ROOT, fmt_key, load_config, load_json, save_json
 
 STAGES = ["prepare", "sweep", "select", "pretrain", "downstream", "evaluate", "analyze", "aggregate"]
+EXIT_PAUSED = 3  # time budget reached: progress is saved, rerun the same command to continue
+
+
+class OutOfTime(Exception):
+    """Raised instead of starting a job once the time budget (--deadline_ts / --budget_h) is used up."""
 PY = sys.executable
 SCRIPTS = ROOT / "scripts"
 
 
 class Runner:
-    def __init__(self, cfg, dry_run=False, downstream_jobs=None, pretrain_jobs=None):
+    def __init__(self, cfg, dry_run=False, downstream_jobs=None, pretrain_jobs=None, gpus=None, deadline=None):
         self.cfg, self.dry = cfg, dry_run
         par = cfg.get("parallel", {}) or {}
+        g = gpus if gpus is not None else par.get("gpus")
+        self.gpus = [int(x) for x in str(g).split(",") if str(x).strip() != ""] if g not in (None, "") else []
+        self.deadline = deadline  # unix time after which no new job is started
+        self.out_of_time = False
         self.downstream_jobs = max(1, int(downstream_jobs or par.get("downstream_jobs", 1)))
         self.pretrain_jobs = max(1, int(pretrain_jobs or par.get("pretrain_jobs", 1)))
         self._print_lock = threading.Lock()
@@ -51,15 +61,26 @@ class Runner:
         with self._print_lock:
             print(msg, flush=True)
 
-    def run(self, script, args, log_name, n_parallel=1):
+    def time_left(self) -> float:
+        return float("inf") if self.deadline is None else self.deadline - time.time()
+
+    def run(self, script, args, log_name, n_parallel=1, gpu=None):
         """Run one script as a subprocess, logging to runs/logs/<log_name>.log."""
+        if self.time_left() <= 0:
+            self.out_of_time = True
+            raise OutOfTime(log_name)
+        if self.deadline is not None and script == "pretrain.py":
+            args = list(args) + ["--deadline", self.deadline]  # pre-training pauses itself at an epoch end
         cmd = [PY, "-u", str(SCRIPTS / script)] + [str(a) for a in args]
-        tag = f"[{log_name}] " if n_parallel > 1 else ""
+        label = log_name if gpu is None else f"{log_name} gpu{gpu}"
+        tag = f"[{label}] " if (n_parallel > 1 or gpu is not None) else ""
         self.say(f"{tag}$ " + " ".join(cmd[2:]))
         if self.dry:
             return
         t = time.time()
         env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        if gpu is not None:
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu)
         if n_parallel > 1:  # share CPU threads between concurrent jobs instead of oversubscribing
             env["OMP_NUM_THREADS"] = str(max(1, (os.cpu_count() or 4) // n_parallel))
         with open(self.logs / f"{log_name}.log", "a", encoding="utf-8") as log:
@@ -71,6 +92,9 @@ class Runner:
                 if any(k in line for k in ("==", "done", "skip", "Error", "error", "Traceback", "best val")):
                     self.say(f"   {tag}" + line.rstrip())
             p.wait()
+        if p.returncode == EXIT_PAUSED:
+            self.out_of_time = True
+            raise OutOfTime(log_name)
         if p.returncode != 0:
             raise RuntimeError(f"{script} failed (exit {p.returncode}); see {self.logs / (log_name + '.log')}")
         self.say(f"   {tag}({time.time() - t:.0f}s)")
@@ -87,21 +111,42 @@ class Runner:
         n = min(n_parallel, len(jobs))
         if n <= 1 or self.dry:
             for j in jobs:
-                self.run(*j)
+                self.run(*j, gpu=self.gpus[0] if self.gpus else None)  # OutOfTime propagates to main()
             return
-        self.say(f"running {len(jobs)} jobs, {n} at a time")
-        failures, done = [], 0
+        # one token per concurrent slot, spread round-robin over the GPUs (e.g. 4 jobs on 2 GPUs -> 2 each)
+        slots: queue.Queue = queue.Queue()
+        for i in range(n):
+            slots.put(self.gpus[i % len(self.gpus)] if self.gpus else None)
+
+        def work(job):
+            g = slots.get()
+            try:
+                return self.run(*job, n_parallel=n, gpu=g)
+            finally:
+                slots.put(g)
+
+        where = f" over GPUs {self.gpus}" if self.gpus else ""
+        self.say(f"running {len(jobs)} jobs, {n} at a time{where}")
+        failures, done, paused = [], 0, 0
         with ThreadPoolExecutor(max_workers=n) as pool:
-            futs = {pool.submit(self.run, *j, n_parallel=n): j for j in jobs}
+            futs = {pool.submit(work, j): j for j in jobs}
             for fut in as_completed(futs):
-                done += 1
                 try:
                     fut.result()
+                    done += 1
+                except OutOfTime:
+                    paused += 1
+                    continue
                 except Exception as e:  # noqa: BLE001
+                    done += 1
                     failures.append(f"{futs[fut][2]}: {e}")
                 self.say(f"-- progress {done}/{len(jobs)} ({len(failures)} failed)")
+        if paused:
+            self.say(f"-- time budget reached: {paused} job(s) left for the next session")
         if failures:
             raise RuntimeError(f"{len(failures)} job(s) failed:\n  " + "\n  ".join(failures))
+        if paused:
+            raise OutOfTime(f"{paused} jobs")
 
     # ------------------------------------------------------------------ naming
     @staticmethod
@@ -204,9 +249,10 @@ class Runner:
         if (ROOT / self.cfg["data_dir"] / "splits.json").exists():
             print("data ready")
             return
+        extra = ["--delete_raw"] if self.cfg.get("delete_raw_data") else []
         self.run("prepare_data.py", ["--data_dir", self.cfg["data_dir"], "--fractions", *sp["fractions"],
                                      "--val_per_class", sp["val_per_class"], "--split_seed", sp["split_seed"],
-                                     "--unlabeled_holdout", sp["unlabeled_holdout"]], "prepare")
+                                     "--unlabeled_holdout", sp["unlabeled_holdout"], *extra], "prepare")
 
     def stage_sweep(self, only=None):
         sel = self.cfg["lambda_sweep"]["selection"]
@@ -316,16 +362,31 @@ def main():
                     help="downstream runs to execute concurrently on the GPU (overrides parallel.downstream_jobs)")
     ap.add_argument("--pretrain_jobs", type=int, default=None,
                     help="AE pre-trainings to execute concurrently (overrides parallel.pretrain_jobs)")
+    ap.add_argument("--gpus", default=None, help="comma-separated GPU ids to spread jobs over, e.g. 0,1")
+    ap.add_argument("--budget_h", type=float, default=None, help="stop starting new work after this many hours")
+    ap.add_argument("--deadline_ts", type=float, default=None, help="same as --budget_h, as an absolute unix time")
     args = ap.parse_args()
-    cfg = load_yaml(ROOT / args.config)
-    r = Runner(cfg, args.dry_run, args.jobs, args.pretrain_jobs)
+    cfg = load_config(ROOT / args.config)
     t0 = time.time()
+    deadline = args.deadline_ts or (t0 + 3600 * args.budget_h if args.budget_h else None)
+    r = Runner(cfg, args.dry_run, args.jobs, args.pretrain_jobs, args.gpus, deadline)
     for st in STAGES:
         if st not in args.stages:
             continue
+        if r.time_left() <= 0:
+            r.out_of_time = True
+            break
         print(f"\n######## stage: {st}", flush=True)
         fn = getattr(r, f"stage_{st}")
-        fn(args.only) if st in ("sweep", "pretrain", "downstream") else fn()
+        try:
+            fn(args.only) if st in ("sweep", "pretrain", "downstream") else fn()
+        except OutOfTime:
+            r.out_of_time = True
+            break
+    if r.out_of_time:
+        print(f"\nTIME BUDGET REACHED after {(time.time() - t0) / 3600:.2f} h. Finished work is saved; unfinished "
+              f"jobs were not started or were checkpointed. Rerun the same command to continue.", flush=True)
+        sys.exit(EXIT_PAUSED)
     print(f"\nall requested stages finished in {(time.time() - t0) / 3600:.2f} h")
 
 
